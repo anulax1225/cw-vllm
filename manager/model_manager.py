@@ -180,7 +180,7 @@ class ModelManager:
                 # These attrs were added in vLLM 0.11+ — set them safely
                 if hasattr(engine_args, "kv_offloading_size"):
                     engine_args.kv_offloading_size = kv_offload_size
-                    engine_args.kv_offloading_backend = kv_backend
+                    engine_args.kv_offloading_backend = "lmcache"
                     logger.info(
                         f"KV cache offloading enabled: {kv_offload_size}GB "
                         f"buffer, backend={kv_backend}"
