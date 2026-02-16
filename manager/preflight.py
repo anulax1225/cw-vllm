@@ -725,19 +725,15 @@ def check_oom_estimate(
     """
     Check #4: Estimate if model will fit in available memory.
 
-    Implements a combined offloading strategy (vLLM v0.15):
+    Layered offloading strategy — each layer is added on top of the
+    previous one until the model fits, or we run out of options:
 
-    Phase 1 — Single strategies (simplest first):
-      1a. Weights fit → KV offload only
-      1b. Weights slightly over → cpu_offload only
-      1c. Weights way over → BnB only
+      Layer 1: KV cache offload to CPU (async DMA, no pinned memory, works on WSL)
+      Layer 2: CPU weight offload (needs CUDA pinned memory / UVA)
+      Layer 3: BitsAndBytes NF4 on-the-fly quantization (shrinks weights 4x)
 
-    Phase 2 — Combined strategies (if single didn't work):
-      2a. BnB + KV offload (quantize weights AND offload KV)
-      2b. BnB + context cap (handled downstream by context check)
-      2c. cpu_offload + KV offload
-
-    Phase 3 — BLOCK with helpful message
+    The layers stack: if KV offload alone isn't enough, try KV offload +
+    weight offload, then KV offload + BnB, etc.
     """
     estimated_bytes, details = estimate_model_memory(
         snapshot_path, model_config, max_model_len
@@ -766,173 +762,217 @@ def check_oom_estimate(
     weight_bytes = details.get("weight_bytes", 0)
     kv_cache_bytes = details.get("kv_cache_bytes", 0)
 
-    if ratio > 1.2:  # More than 20% over available
-        def _can_pin_memory():
-            if platform.is_wsl:
-                return False
-            try:
-                import torch
-                t = torch.empty(1, pin_memory=True)
-                del t
-                return True
-            except Exception:
-                return False
-
-        if not platform.has_gpu:
+    if ratio <= 1.2:
+        # Fits (or close enough)
+        if ratio > 0.85:
             return CheckResult(
                 check_id=CheckId.OOM_ESTIMATE,
-                severity=CheckSeverity.BLOCK,
-                message=f"Model requires ~{estimated_bytes / 1e9:.1f}GB but only "
-                f"~{available / 1e9:.1f}GB {memory_type} available.",
-                suggestion="Use a smaller model.",
+                severity=CheckSeverity.WARN,
+                message=f"Model may be tight on memory (~{ratio:.0%} of available "
+                f"{memory_type}). Consider reducing max_model_len.",
                 details=details,
             )
+        return None
 
-        # ─── Strategy 1: KV offload (best option — no pinned memory needed, ───
-        # ───             works on WSL, minimal perf impact)                  ───
-        kv_result = _try_kv_offload(
-            model_config=model_config,
-            platform=platform,
-            kv_cache_bytes=kv_cache_bytes,
-            available_vram=available,
-            weight_bytes=weight_bytes,
-            max_model_len=max_model_len or 4096,
-            kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
-            details=details,
-        )
-        if kv_result is not None:
-            return kv_result
+    # ─── Doesn't fit — try layered offloading ───
 
-        # ─── Strategy 2: BnB quantization (full GPU speed, lower quality) ───
-        bnb_result = _try_bnb_quantization(
-            model_config, platform, weight_bytes, kv_cache_bytes, available, details,
-        )
-        if bnb_result is not None:
-            return bnb_result
-
-        # ─── Strategy 3: cpu_offload (needs pinned memory / UVA) ───
-        offload_bytes = max(0, weight_bytes + kv_cache_bytes - int(available * 0.80))
-        offload_gb = max(1, int((offload_bytes / 1e9) + 1))
-        if _can_pin_memory() and platform.cpu_ram_bytes > (offload_gb * 1e9 * 1.5):
-            details["cpu_offload_gb"] = offload_gb
-            details["force_enforce_eager"] = True
-            return CheckResult(
-                check_id=CheckId.OOM_ESTIMATE,
-                severity=CheckSeverity.AUTOFIX,
-                message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV cache ({kv_cache_bytes/1e9:.1f}GB) "
-                f"exceed {available/1e9:.1f}GB VRAM. Offloading {offload_gb}GB to CPU RAM. "
-                f"enforce_eager enabled for stability.",
-                auto_fixed=True,
-                details=details,
-            )
-
-        # ─── Strategy 4: BnB + KV offload combined ───
-        bnb_weight_bytes = weight_bytes / 4
-        bnb_overhead = bnb_weight_bytes + 0.5e9 + int(bnb_weight_bytes * 0.10)
-        if bnb_overhead < available:
-            kv_details = dict(details)
-            kv_result = _try_kv_offload(
-                model_config=model_config,
-                platform=platform,
-                kv_cache_bytes=kv_cache_bytes,
-                available_vram=available,
-                weight_bytes=int(bnb_weight_bytes),
-                max_model_len=max_model_len or 4096,
-                kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
-                details=kv_details,
-            )
-            if kv_result is not None:
-                # Check model isn't already quantized (BnB requirement)
-                quant_config = model_config.get("quantization_config", {})
-                existing_quant = quant_config.get("quant_method", "").lower()
-                if not existing_quant:
-                    kv_details["bnb_quantize"] = True
-                    kv_details["bnb_weight_bytes"] = int(bnb_weight_bytes)
-                    return CheckResult(
-                        check_id=CheckId.OOM_ESTIMATE,
-                        severity=CheckSeverity.AUTOFIX,
-                        message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV ({kv_cache_bytes/1e9:.1f}GB) "
-                        f"exceed {available/1e9:.1f}GB VRAM. Auto-enabling BnB NF4 quantization "
-                        f"(~{bnb_weight_bytes/1e9:.1f}GB) + KV cache offloading to CPU.",
-                        auto_fixed=True,
-                        details=kv_details,
-                    )
-
-        # ─── Strategy 5: cpu_offload + KV offload combined ───
-        if _can_pin_memory():
-            kv_details = dict(details)
-            kv_result = _try_kv_offload(
-                model_config=model_config,
-                platform=platform,
-                kv_cache_bytes=kv_cache_bytes,
-                available_vram=available,
-                weight_bytes=weight_bytes,
-                max_model_len=max_model_len or 4096,
-                kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
-                details=kv_details,
-            )
-            if kv_result is not None:
-                remaining_offload = max(0, weight_bytes - int(available * 0.80))
-                remaining_gb = max(1, int((remaining_offload / 1e9) + 1))
-                if platform.cpu_ram_bytes > (remaining_gb * 1e9 * 1.5):
-                    kv_details["cpu_offload_gb"] = remaining_gb
-                    kv_details["force_enforce_eager"] = True
-                    return CheckResult(
-                        check_id=CheckId.OOM_ESTIMATE,
-                        severity=CheckSeverity.AUTOFIX,
-                        message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV ({kv_cache_bytes/1e9:.1f}GB) "
-                        f"exceed {available/1e9:.1f}GB VRAM. Offloading {remaining_gb}GB weights "
-                        f"+ KV cache to CPU. enforce_eager enabled.",
-                        auto_fixed=True,
-                        details=kv_details,
-                    )
-
-        # ─── BLOCK — nothing worked ───
-        strategies_tried = ["KV cache offloading to CPU"]
-        kv_reject = details.get("kv_offload_rejected_reason", "")
-        if kv_reject == "weights_exceed_vram":
-            strategies_tried[-1] += " (weights alone exceed VRAM)"
-        elif kv_reject == "ram_budget":
-            strategies_tried[-1] += f" (needs {details.get('kv_offload_needed_gb', '?')}GB RAM)"
-
-        quant_config = model_config.get("quantization_config", {})
-        existing_quant = quant_config.get("quant_method", "")
-        if existing_quant:
-            strategies_tried.append(
-                f"BnB quantization (model already quantized as {existing_quant})"
-            )
-        else:
-            strategies_tried.append("BnB quantization (still too large)")
-
-        if not _can_pin_memory():
-            strategies_tried.append(
-                "CPU weight offloading ("
-                + ("WSL lacks CUDA pinned memory" if platform.is_wsl else "pinned memory unavailable")
-                + ")"
-            )
-        else:
-            strategies_tried.append("CPU weight offloading (insufficient RAM)")
-
+    if not platform.has_gpu:
         return CheckResult(
             check_id=CheckId.OOM_ESTIMATE,
             severity=CheckSeverity.BLOCK,
-            message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV cache ({kv_cache_bytes/1e9:.1f}GB) "
-            f"exceed {available/1e9:.1f}GB VRAM. Tried: "
-            + "; ".join(strategies_tried) + ".",
-            suggestion=f"Use a smaller/more quantized model. "
-            f"You have ~{available/1e9:.1f}GB usable VRAM.",
-            details=details,
-        )
-    elif ratio > 0.85:
-        return CheckResult(
-            check_id=CheckId.OOM_ESTIMATE,
-            severity=CheckSeverity.WARN,
-            message=f"Model may be tight on memory (~{ratio:.0%} of available "
-            f"{memory_type}). Consider reducing max_model_len.",
+            message=f"Model requires ~{estimated_bytes / 1e9:.1f}GB but only "
+            f"~{available / 1e9:.1f}GB {memory_type} available.",
+            suggestion="Use a smaller model.",
             details=details,
         )
 
-    return None
+    # Helper: check pinned memory availability (needed for cpu_offload_gb)
+    def _can_pin_memory():
+        if platform.is_wsl:
+            return False
+        try:
+            import torch
+            t = torch.empty(1, pin_memory=True)
+            del t
+            return True
+        except Exception:
+            return False
+
+    # ──────────────────────────────────────────────────────────────
+    # We build up a "plan" by layering strategies. At each step we
+    # recalculate effective sizes and check if the model fits.
+    # ──────────────────────────────────────────────────────────────
+
+    strategies_applied = []  # Human-readable list of what we're doing
+    effective_weight = weight_bytes
+    effective_kv = kv_cache_bytes
+    plan_details = dict(details)
+
+    # ─── Layer 1: KV cache offload ───────────────────────────────
+    # Always try this first — cheapest, no pinned memory, works on WSL.
+    kv_result = _try_kv_offload(
+        model_config=model_config,
+        platform=platform,
+        kv_cache_bytes=kv_cache_bytes,
+        available_vram=available,
+        weight_bytes=effective_weight,
+        max_model_len=max_model_len or 4096,
+        kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
+        details=plan_details,
+    )
+
+    kv_offloaded = False
+    if kv_result is not None:
+        kv_offloaded = True
+        kv_offload_gb = plan_details.get("kv_offload_size_gb", 0)
+        kv_freed = plan_details.get("kv_overflow_bytes", 0)
+        effective_kv = max(0, kv_cache_bytes - kv_freed)
+        strategies_applied.append(f"KV cache offload ({kv_offload_gb}GB to CPU)")
+
+    # Check: does it fit now?
+    cuda_overhead = 500 * 1024 * 1024
+    activation_overhead = int(effective_weight * 0.10)
+    total_needed = effective_weight + effective_kv + cuda_overhead + activation_overhead
+    if total_needed <= available:
+        # KV offload alone is enough
+        if kv_result is not None and kv_result.check_id == CheckId.KV_OFFLOAD_ENABLED:
+            return kv_result
+        return CheckResult(
+            check_id=CheckId.KV_OFFLOAD_ENABLED,
+            severity=CheckSeverity.AUTOFIX,
+            message=f"KV cache offloaded to CPU. "
+            + "; ".join(strategies_applied) + ".",
+            auto_fixed=True,
+            details=plan_details,
+        )
+
+    # ─── Layer 2: CPU weight offload ─────────────────────────────
+    # Offload the portion of weights that doesn't fit alongside
+    # the (possibly reduced) KV cache.
+    weight_offloaded = False
+    vram_for_weights = available - effective_kv - cuda_overhead - activation_overhead
+    if vram_for_weights < effective_weight and _can_pin_memory():
+        offload_bytes = effective_weight - max(0, vram_for_weights)
+        offload_gb = max(1, int((offload_bytes / 1e9) + 1))
+        if platform.cpu_ram_bytes > (offload_gb * 1e9 * 1.5):
+            plan_details["cpu_offload_gb"] = offload_gb
+            plan_details["force_enforce_eager"] = True
+            weight_offloaded = True
+            strategies_applied.append(f"CPU weight offload ({offload_gb}GB)")
+            # Effective weight on GPU is reduced
+            effective_weight = max(0, effective_weight - int(offload_bytes))
+
+    # Check: does it fit now?
+    activation_overhead = int(effective_weight * 0.10)
+    total_needed = effective_weight + effective_kv + cuda_overhead + activation_overhead
+    if total_needed <= available:
+        msg_parts = "; ".join(strategies_applied)
+        return CheckResult(
+            check_id=CheckId.OOM_ESTIMATE,
+            severity=CheckSeverity.AUTOFIX,
+            message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV ({kv_cache_bytes/1e9:.1f}GB) "
+            f"exceed {available/1e9:.1f}GB VRAM. Auto-fix: {msg_parts}.",
+            auto_fixed=True,
+            details=plan_details,
+        )
+
+    # ─── Layer 3: BitsAndBytes NF4 quantization ──────────────────
+    # Last resort — quantize weights to ~1/4 size at load time.
+    bnb_applied = False
+    bnb_result = _try_bnb_quantization(
+        model_config, platform, weight_bytes, kv_cache_bytes, available, plan_details,
+    )
+    if bnb_result is not None:
+        bnb_applied = True
+        bnb_weight = plan_details.get("bnb_weight_bytes", weight_bytes // 4)
+        effective_weight = bnb_weight
+        strategies_applied.append(f"BnB NF4 quantization (~{bnb_weight/1e9:.1f}GB)")
+
+        # With BnB, re-check if KV offload is needed/possible with the smaller weights
+        if not kv_offloaded:
+            kv_plan = dict(plan_details)
+            kv_r = _try_kv_offload(
+                model_config=model_config,
+                platform=platform,
+                kv_cache_bytes=kv_cache_bytes,
+                available_vram=available,
+                weight_bytes=int(effective_weight),
+                max_model_len=max_model_len or 4096,
+                kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
+                details=kv_plan,
+            )
+            if kv_r is not None:
+                kv_offloaded = True
+                plan_details.update(kv_plan)
+                kv_freed = kv_plan.get("kv_overflow_bytes", 0)
+                effective_kv = max(0, kv_cache_bytes - kv_freed)
+                kv_gb = kv_plan.get("kv_offload_size_gb", 0)
+                strategies_applied.append(f"KV cache offload ({kv_gb}GB to CPU)")
+
+    # Check: does it fit now?
+    activation_overhead = int(effective_weight * 0.10)
+    total_needed = effective_weight + effective_kv + cuda_overhead + activation_overhead
+    if total_needed <= available:
+        msg_parts = "; ".join(strategies_applied)
+        return CheckResult(
+            check_id=CheckId.OOM_ESTIMATE,
+            severity=CheckSeverity.AUTOFIX,
+            message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV ({kv_cache_bytes/1e9:.1f}GB) "
+            f"exceed {available/1e9:.1f}GB VRAM. Auto-fix: {msg_parts}.",
+            auto_fixed=True,
+            details=plan_details,
+        )
+
+    # ─── BLOCK — nothing worked ──────────────────────────────────
+    strategies_tried = []
+
+    # KV offload status
+    kv_reject = plan_details.get("kv_offload_rejected_reason", "")
+    if kv_offloaded:
+        strategies_tried.append("KV cache offload (applied but insufficient)")
+    elif kv_reject == "weights_exceed_vram":
+        strategies_tried.append("KV cache offload (weights alone exceed VRAM)")
+    elif kv_reject == "ram_budget":
+        strategies_tried.append(
+            f"KV cache offload (needs {plan_details.get('kv_offload_needed_gb', '?')}GB RAM)"
+        )
+    else:
+        strategies_tried.append("KV cache offload (not viable)")
+
+    # Weight offload status
+    if weight_offloaded:
+        strategies_tried.append("CPU weight offload (applied but insufficient)")
+    elif not _can_pin_memory():
+        strategies_tried.append(
+            "CPU weight offload ("
+            + ("WSL lacks CUDA pinned memory" if platform.is_wsl else "pinned memory unavailable")
+            + ")"
+        )
+    else:
+        strategies_tried.append("CPU weight offload (insufficient RAM)")
+
+    # BnB status
+    quant_config = model_config.get("quantization_config", {})
+    existing_quant = quant_config.get("quant_method", "")
+    if bnb_applied:
+        strategies_tried.append("BnB quantization (applied but still too large)")
+    elif existing_quant:
+        strategies_tried.append(
+            f"BnB quantization (model already quantized as {existing_quant})"
+        )
+    else:
+        strategies_tried.append("BnB quantization (still too large)")
+
+    return CheckResult(
+        check_id=CheckId.OOM_ESTIMATE,
+        severity=CheckSeverity.BLOCK,
+        message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV cache ({kv_cache_bytes/1e9:.1f}GB) "
+        f"exceed {available/1e9:.1f}GB VRAM. Tried: "
+        + "; ".join(strategies_tried) + ".",
+        suggestion=f"Use a smaller/more quantized model. "
+        f"You have ~{available/1e9:.1f}GB usable VRAM.",
+        details=plan_details,
+    )
 
 
 def check_context_length_mismatch(
