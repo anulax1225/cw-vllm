@@ -1,0 +1,9 @@
+# Bundled chat templates for tool calling
+
+# Copy these files from vLLM's examples/ directory:
+# - tool_chat_template_llama3_json.jinja
+# - tool_chat_template_mistral_parallel.jinja
+# - tool_chat_template_gemma3_pythonic.jinja
+#
+# Or add to Dockerfile:
+# COPY --from=vllm-source /vllm/examples/tool_chat_template_*.jinja /opt/vllm-manager/templates/

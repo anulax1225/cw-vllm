@@ -1,0 +1,23 @@
+# vLLM Manager v6 — Embedded Engine
+# Single process with AsyncLLMEngine (no subprocess)
+FROM vllm/vllm-openai-rocm:latest
+
+# Install manager dependencies
+COPY manager/requirements.txt /opt/vllm-manager/requirements.txt
+RUN pip install --no-cache-dir -r /opt/vllm-manager/requirements.txt
+
+# Copy manager code
+COPY manager/ /opt/vllm-manager/
+
+# Environment
+ENV MANAGER_PORT=8000
+ENV VLLM_KEEP_ALIVE=5m
+ENV VLLM_GPU_MEMORY_UTILIZATION=0.9
+ENV VLLM_TENSOR_PARALLEL_SIZE=1
+ENV PYTHONPATH=/opt/vllm-manager
+
+EXPOSE 8000
+
+# Single process - embedded engine, no subprocess
+ENTRYPOINT ["python3", "-m", "main"]
+WORKDIR /opt/vllm-manager
