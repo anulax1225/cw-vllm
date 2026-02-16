@@ -75,6 +75,14 @@ class ManagerConfig(BaseSettings):
     vllm_enforce_eager: bool = False  # Force eager mode (no CUDA graphs)
     vllm_dtype: str = "auto"  # Explicit dtype override
 
+    # KV cache offloading settings
+    # Maximum percentage of system RAM that KV cache offloading is allowed to use.
+    # When the estimated KV offloading buffer would exceed this percentage, the
+    # preflight system caps context length instead of offloading.
+    # Range: 0.0 to 1.0 (e.g. 0.5 = 50% of RAM). Default: 0.5 (50%).
+    # Set to 0 to disable KV offloading entirely (always cap context instead).
+    vllm_kv_offload_max_ram_fraction: float = 0.5
+
     # Capability overrides (None = auto-detect)
     vllm_reasoning_parser: Optional[str] = None  # VLLM_REASONING_PARSER
     vllm_tool_parser: Optional[str] = None  # VLLM_TOOL_PARSER
@@ -100,6 +108,16 @@ class ManagerConfig(BaseSettings):
         if isinstance(v, str) and v.strip() == "":
             return None
         return v
+
+    @field_validator("vllm_kv_offload_max_ram_fraction", mode="before")
+    @classmethod
+    def clamp_ram_fraction(cls, v):
+        """Clamp to [0.0, 1.0] range."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 0.5
+        return max(0.0, min(1.0, v))
 
     model_config = {"env_prefix": "", "extra": "ignore"}
 

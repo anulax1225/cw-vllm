@@ -5,9 +5,13 @@ Manages AsyncLLMEngine lifecycle:
 - Auto-load on inference request
 - Auto-switch when model changes
 - Auto-unload after keep_alive inactivity timeout
+
+Compatible with vLLM V1 (AsyncLLM) — the V0 engine was removed in vLLM 0.11+.
+AsyncLLMEngine is now an alias for AsyncLLM in modern vLLM.
 """
 
 import asyncio
+import contextlib
 import gc
 import inspect
 import json
@@ -76,78 +80,65 @@ class ModelManager:
         This is called before every inference request — the Ollama pattern.
         The keep_alive parameter can override the default per-request.
         """
-        # Fast path: model already loaded and ready
-        if self.current_model == model and self.state == "ready":
+        if keep_alive is not None:
+            self.keep_alive = keep_alive
+
+        # Already loaded and ready
+        if self.current_model == model and self.state == "ready" and self.engine is not None:
             self.last_used = time.time()
-            if keep_alive is not None:
-                self.keep_alive = keep_alive
-                self._restart_keep_alive_timer()
+            self._restart_keep_alive_timer()
             return
 
         async with self._lock:
             # Double-check after acquiring lock
-            if self.current_model == model and self.state == "ready":
+            if self.current_model == model and self.state == "ready" and self.engine is not None:
                 self.last_used = time.time()
+                self._restart_keep_alive_timer()
                 return
 
-            # Need to load (possibly after unloading current)
+            # Different model loaded — switch
+            if self.current_model and self.current_model != model:
+                logger.info(f"Switching model: {self.current_model} → {model}")
+                await self._unload()
+
+            # Load the requested model
             await self._load(model)
 
-            if keep_alive is not None:
-                self.keep_alive = keep_alive
-
-    # ── Load / Unload ───────────────────────────────────────────────
-
     async def _load(self, model: str) -> None:
-        """Create vLLM engine for the given model."""
-
-        # Unload current model if any
-        if self.engine is not None:
-            await self._unload()
-
+        """Load a model into the engine."""
         self.state = "loading"
-        self.current_model = model
         self.error_message = None
-        self._last_preflight = None
         logger.info(f"Loading model: {model}")
 
         try:
-            # Resolve tokenizer for community-quantized models
-            tokenizer = self.config.vllm_tokenizer or None
-            if not tokenizer:
-                tokenizer = resolve_tokenizer(model, hf_token=self.config.hf_token)
-
+            # Resolve tokenizer (for community-quantized models)
+            tokenizer = resolve_tokenizer(model, hf_token=self.config.hf_token)
             if tokenizer:
                 logger.info(f"Using external tokenizer: {tokenizer}")
                 ensure_tokenizer_available(tokenizer, hf_token=self.config.hf_token)
 
-            # Preflight validation (runs before engine creation)
-            engine_overrides = {}
-            if self.config.vllm_preflight_enabled:
-                preflight_result = await preflight_check(
-                    model_id=model,
-                    config=self.config,
-                    resolved_tokenizer=tokenizer,
-                )
-                self._last_preflight = preflight_result
-
-                if preflight_result.blocked:
-                    raise PreflightError(preflight_result)
-
-                # Log warnings
-                for warning in preflight_result.warnings:
-                    logger.warning(f"[PREFLIGHT] {warning}")
-
-                engine_overrides = preflight_result.engine_overrides
-
-            # Detect model capabilities from config
-            model_config = (
-                preflight_result.model_config
-                if self.config.vllm_preflight_enabled and preflight_result
-                else {}
+            # Run preflight checks
+            preflight_result = await preflight_check(
+                model_id=model,
+                config=self.config,
+                resolved_tokenizer=tokenizer,
             )
+            self._last_preflight = preflight_result
+
+            if not preflight_result.passed:
+                raise PreflightError(preflight_result)
+
+            for warning in preflight_result.warnings:
+                logger.warning(f"[preflight] {warning}")
+
+            # Get engine overrides from preflight
+            engine_overrides = preflight_result.engine_overrides or {}
+
+            # Detect model capabilities
             self.caps = detect_capabilities(
-                model, model_config, self._get_user_overrides()
+                model_id=model,
+                model_config=getattr(preflight_result, "model_config", None) or {},
+                user_overrides=self._get_user_overrides()
             )
 
             # Build engine args with preflight overrides
@@ -177,6 +168,28 @@ class ModelManager:
                 cpu_offload_gb=engine_overrides.get("cpu_offload_gb", 0),
             )
 
+            # KV cache offloading (vLLM 0.11+ native offloading connector).
+            # These are separate from cpu_offload_gb (which offloads model weights).
+            # kv_offloading_size offloads KV cache blocks to CPU RAM via async DMA,
+            # with minimal impact on per-token latency.
+            kv_offload_size = engine_overrides.get("kv_offloading_size")
+            if kv_offload_size:
+                kv_backend = engine_overrides.get("kv_offloading_backend", "native")
+                # These attrs were added in vLLM 0.11+ — set them safely
+                if hasattr(engine_args, "kv_offloading_size"):
+                    engine_args.kv_offloading_size = kv_offload_size
+                    engine_args.kv_offloading_backend = kv_backend
+                    logger.info(
+                        f"KV cache offloading enabled: {kv_offload_size}GB "
+                        f"buffer, backend={kv_backend}"
+                    )
+                else:
+                    logger.warning(
+                        f"KV offloading requested ({kv_offload_size}GB) but "
+                        f"this vLLM version does not support kv_offloading_size. "
+                        f"Context length may be capped instead."
+                    )
+
             # CPU-specific settings
             if self.config.is_cpu:
                 engine_args.device = "cpu"
@@ -200,6 +213,7 @@ class ModelManager:
                 f"tools={self.caps.tool_call_parser}"
             )
 
+            self.current_model = model
             self.state = "ready"
             self.last_used = time.time()
             self._start_keep_alive_timer()
@@ -238,6 +252,9 @@ class ModelManager:
         self.tokenizer = None
         self.parser = None
 
+        # Destroy distributed process groups (critical for tensor_parallel > 1)
+        self._destroy_distributed()
+
         # Aggressive garbage collection
         gc.collect()
         gc.collect()
@@ -253,6 +270,22 @@ class ModelManager:
         self.state = "idle"
         logger.info("GPU memory cleanup complete")
 
+    @staticmethod
+    def _destroy_distributed() -> None:
+        """Tear down distributed process groups to free GPU resources.
+        Critical when tensor_parallel_size > 1."""
+        try:
+            from vllm.distributed.parallel_state import destroy_model_parallel
+            destroy_model_parallel()
+        except ImportError:
+            # Older vLLM or different module path — skip
+            pass
+        except Exception as e:
+            logger.debug(f"destroy_model_parallel failed (non-fatal): {e}")
+
+        with contextlib.suppress(AssertionError, RuntimeError):
+            torch.distributed.destroy_process_group()
+
     async def _unload(self) -> None:
         """Destroy engine and free all GPU memory."""
         if self.engine is None:
@@ -265,15 +298,28 @@ class ModelManager:
 
         self._stop_keep_alive_timer()
 
-        # Destroy engine
-        # vLLM's AsyncLLMEngine holds GPU tensors — deleting it triggers cleanup
+        # Properly shut down the engine before deleting.
+        # vLLM V1 (AsyncLLM) uses shutdown(); V0 used shutdown_background_loop().
         engine = self.engine
         self.engine = None
         self.tokenizer = None
         self.current_model = None
         self.caps = None
         self.parser = None
+
+        # Try V1-style shutdown first, then V0 fallback
+        try:
+            if hasattr(engine, 'shutdown'):
+                engine.shutdown()
+            elif hasattr(engine, 'shutdown_background_loop'):
+                engine.shutdown_background_loop()
+        except Exception as e:
+            logger.warning(f"Engine shutdown method failed (non-fatal): {e}")
+
         del engine
+
+        # Destroy distributed process groups
+        self._destroy_distributed()
 
         # Force GPU memory release
         gc.collect()
@@ -457,99 +503,93 @@ class ModelManager:
         previous_text = ""
         previous_token_ids: list[int] = []
 
-        async for request_output in results_generator:
-            if not request_output.outputs:
-                continue
+        try:
+            async for request_output in results_generator:
+                if not request_output.outputs:
+                    continue
 
-            output = request_output.outputs[0]
-            current_text = output.text
-            current_token_ids = list(output.token_ids)
-            delta_text = current_text[len(previous_text):]
-            delta_token_ids = current_token_ids[len(previous_token_ids):]
-            is_finished = output.finish_reason is not None
+                output = request_output.outputs[0]
+                current_text = output.text
+                current_token_ids = list(output.token_ids)
+                delta_text = current_text[len(previous_text):]
+                delta_token_ids = current_token_ids[len(previous_token_ids):]
+                is_finished = output.finish_reason is not None
 
-            if delta_text or is_finished:
-                # Build SSE chunk delta
-                chunk_delta = {}
+                if delta_text or is_finished:
+                    # Build SSE chunk delta
+                    chunk_delta = {}
 
-                if request_parser and delta_text:
-                    delta_msg = request_parser.parse_streaming(
-                        previous_text=previous_text,
-                        current_text=current_text,
-                        delta_text=delta_text,
-                        previous_token_ids=previous_token_ids,
-                        current_token_ids=current_token_ids,
-                        delta_token_ids=delta_token_ids,
-                        request=parser_request,
-                    )
-
-                    if delta_msg is not None:
-                        if getattr(delta_msg, "reasoning_content", None) is not None:
-                            chunk_delta["reasoning_content"] = (
-                                delta_msg.reasoning_content
-                            )
-                        if getattr(delta_msg, "content", None) is not None:
-                            chunk_delta["content"] = delta_msg.content
-                        if getattr(delta_msg, "tool_calls", None):
-                            chunk_delta["tool_calls"] = [
-                                tc.model_dump()
-                                if hasattr(tc, "model_dump")
-                                else tc
-                                for tc in delta_msg.tool_calls
-                            ]
-                    else:
-                        # Parser returned None — pass raw delta as content
-                        chunk_delta["content"] = delta_text
-                elif delta_text:
-                    # No parser — raw delta is content
-                    chunk_delta["content"] = delta_text
-
-                # Emit content/reasoning chunk if we have delta
-                if chunk_delta:
-                    chunk = {
-                        "id": f"chatcmpl-{request_id}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": self.current_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": chunk_delta,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                # Send finish reason on last chunk
-                if is_finished:
-                    finish_reason = self._map_finish_reason(output.finish_reason)
-
-                    # Check if tools were called across the full output
-                    if self.parser and self.parser.has_tools and parser_request:
-                        full_parsed = self.parser.parse(
-                            current_text, parser_request
+                    if request_parser and delta_text:
+                        delta_msg = request_parser.parse_streaming(
+                            previous_text=previous_text,
+                            current_text=current_text,
+                            delta_text=delta_text,
+                            previous_token_ids=previous_token_ids,
+                            current_token_ids=current_token_ids,
+                            delta_token_ids=delta_token_ids,
+                            is_finished=is_finished,
                         )
-                        if full_parsed.tools_called:
-                            finish_reason = "tool_calls"
+                        if delta_msg.get("reasoning_content"):
+                            chunk_delta["reasoning_content"] = delta_msg["reasoning_content"]
+                        if delta_msg.get("content"):
+                            chunk_delta["content"] = delta_msg["content"]
+                    elif delta_text:
+                        chunk_delta["content"] = delta_text
 
-                    chunk = {
-                        "id": f"chatcmpl-{request_id}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": self.current_model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": finish_reason,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if chunk_delta:
+                        chunk = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": self.current_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": chunk_delta,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
-            previous_text = current_text
-            previous_token_ids = current_token_ids
+                    # Send finish reason on last chunk
+                    if is_finished:
+                        finish_reason = self._map_finish_reason(output.finish_reason)
+
+                        # Check if tools were called across the full output
+                        if self.parser and self.parser.has_tools and parser_request:
+                            full_parsed = self.parser.parse(
+                                current_text, parser_request
+                            )
+                            if full_parsed.tools_called:
+                                finish_reason = "tool_calls"
+
+                        chunk = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": self.current_model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                previous_text = current_text
+                previous_token_ids = current_token_ids
+
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected — abort the request to free engine resources
+            logger.info(f"Client disconnected, aborting request {request_id}")
+            try:
+                await self.engine.abort(request_id)
+            except Exception as e:
+                logger.debug(f"Abort failed for {request_id} (non-fatal): {e}")
+            return
 
         yield "data: [DONE]\n\n"
 
@@ -704,20 +744,13 @@ class ModelManager:
         if not torch.cuda.is_available():
             return None
         try:
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            total = torch.cuda.get_device_properties(0).total_mem
             return {
-                "allocated_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
-                "reserved_gb": round(torch.cuda.memory_reserved() / 1e9, 2),
-                "total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
+                "allocated_gb": round(allocated / 1e9, 2),
+                "reserved_gb": round(reserved / 1e9, 2),
+                "total_gb": round(total / 1e9, 2),
             }
         except Exception:
             return None
-
-    @staticmethod
-    def _get_total_vram_gb() -> float:
-        """Get total GPU VRAM in GB."""
-        if not torch.cuda.is_available():
-            return 0.0
-        try:
-            return torch.cuda.get_device_properties(0).total_memory / 1e9
-        except Exception:
-            return 0.0

@@ -1,6 +1,7 @@
 # vLLM Manager v6 — Embedded Engine
 # Single process with AsyncLLMEngine (no subprocess)
-FROM vllm/vllm-openai:latest
+# Pinned to v0.15.1 to avoid breaking changes from V0 removal
+FROM vllm/vllm-openai:v0.15.1
 
 # Install manager dependencies
 COPY manager/requirements.txt /opt/vllm-manager/requirements.txt

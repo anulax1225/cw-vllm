@@ -7,11 +7,7 @@ and provide actionable error messages.
 
 from __future__ import annotations
 
-import gc
-import json
-import logging
-import os
-import struct
+import gc, json, logging, os, struct
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -59,6 +55,7 @@ class CheckId(str, Enum):
     CUDA_GRAPH_ERROR = "CUDA_GRAPH_ERROR"
     INCOMPATIBLE_REMOTE_CODE = "INCOMPATIBLE_REMOTE_CODE"
     UNKNOWN_ENGINE_ERROR = "UNKNOWN_ENGINE_ERROR"
+    KV_OFFLOAD_ENABLED = "KV_OFFLOAD_ENABLED"
 
 
 @dataclass
@@ -203,6 +200,99 @@ class PreflightError(Exception):
 # ════════════════════════════════════════════════════════════════════════════
 # Helper Functions
 # ════════════════════════════════════════════════════════════════════════════
+
+def _try_kv_offload(
+    model_config: dict,
+    platform,  # PlatformInfo
+    kv_cache_bytes: int,
+    available_vram: int,
+    weight_bytes: int,
+    max_model_len: int,
+    kv_offload_max_ram_fraction: float,
+    details: dict,
+) -> "Optional[CheckResult]":
+    """
+    Determine if KV cache offloading to CPU can avoid capping context length.
+
+    KV offloading (--kv-offloading-size) moves evicted KV cache blocks to CPU
+    RAM asynchronously via DMA. Unlike cpu_offload_gb (model weight offloading),
+    this has minimal impact on per-token latency because transfers don't block
+    the forward pass.
+
+    Returns a CheckResult with AUTOFIX severity if KV offloading is viable,
+    or None if it's not (caller should fall back to capping context).
+
+    The offloading buffer is capped at kv_offload_max_ram_fraction of system RAM
+    to prevent OOM on the host side.
+    """
+    if not platform.has_gpu:
+        return None
+
+    # KV offloading requires vLLM >= 0.11 (offloading connector)
+    # and works best on >= 0.12 (contiguous block layout)
+    try:
+        import vllm
+        version = getattr(vllm, "__version__", "0.0.0")
+        parts = version.split(".")
+        major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        if major == 0 and minor < 11:
+            return None  # Too old for native KV offloading
+    except (ImportError, ValueError, IndexError):
+        return None
+
+    # Check if KV offloading is disabled (fraction == 0)
+    if kv_offload_max_ram_fraction <= 0:
+        return None
+
+    # Calculate how much KV cache exceeds available VRAM (after weights)
+    vram_for_kv = available_vram - weight_bytes
+    if vram_for_kv <= 0:
+        # Weights alone fill VRAM — KV offloading alone won't help
+        return None
+
+    kv_overflow_bytes = kv_cache_bytes - vram_for_kv
+    if kv_overflow_bytes <= 0:
+        # KV cache fits in VRAM, no offloading needed
+        return None
+
+    # Calculate the CPU RAM budget for KV offloading
+    ram_budget_bytes = int(platform.cpu_ram_bytes * kv_offload_max_ram_fraction)
+
+    # The offloading buffer doesn't need to hold the ENTIRE KV cache overflow.
+    # It's a circular/LRU buffer: vLLM evicts blocks to CPU when GPU is full,
+    # and loads them back when needed. A buffer ~= the overflow is a good target,
+    # with some headroom for double-buffering.
+    offload_buffer_bytes = int(kv_overflow_bytes * 1.2)  # 20% headroom
+
+    if offload_buffer_bytes > ram_budget_bytes:
+        # KV offloading would exceed the RAM budget — not viable at full context.
+        # Caller should fall back to capping context length.
+        details["kv_offload_rejected"] = True
+        details["kv_offload_needed_gb"] = round(offload_buffer_bytes / 1e9, 1)
+        details["kv_offload_ram_budget_gb"] = round(ram_budget_bytes / 1e9, 1)
+        details["kv_offload_max_ram_fraction"] = kv_offload_max_ram_fraction
+        return None
+
+    offload_size_gb = max(1, int(offload_buffer_bytes / 1e9 + 0.5))  # Round up, min 1GB
+
+    details["kv_offload_size_gb"] = offload_size_gb
+    details["kv_overflow_bytes"] = kv_overflow_bytes
+    details["kv_offload_ram_budget_gb"] = round(ram_budget_bytes / 1e9, 1)
+    details["kv_offload_max_ram_fraction"] = kv_offload_max_ram_fraction
+
+    return CheckResult(
+        check_id=CheckId.KV_OFFLOAD_ENABLED,
+        severity=CheckSeverity.AUTOFIX,
+        message=f"KV cache ({kv_cache_bytes/1e9:.1f}GB) exceeds available VRAM for KV "
+        f"({vram_for_kv/1e9:.1f}GB) by {kv_overflow_bytes/1e9:.1f}GB. "
+        f"Auto-enabling native KV cache offloading to CPU "
+        f"(buffer: {offload_size_gb}GB, "
+        f"RAM budget: {round(ram_budget_bytes/1e9, 1)}GB = "
+        f"{kv_offload_max_ram_fraction:.0%} of system RAM).",
+        auto_fixed=True,
+        details=details,
+    )
+
 
 
 def _get_snapshot_path(model_id: str) -> Optional[Path]:
@@ -616,16 +706,29 @@ def _try_bnb_quantization(
         details=details,
     )
 
-
 def check_oom_estimate(
-    snapshot_path: Path,
+    snapshot_path: "Path",
     model_config: dict,
-    platform: PlatformInfo,
+    platform: "PlatformInfo",
     gpu_memory_utilization: float,
-    max_model_len: Optional[int],
-) -> Optional[CheckResult]:
+    max_model_len: "Optional[int]",
+    kv_offload_max_ram_fraction: float = 0.5,
+) -> "Optional[CheckResult]":
     """
     Check #4: Estimate if model will fit in available memory.
+
+    Implements a tiered offloading strategy (vLLM v0.15):
+
+    1. If weights fit but KV cache doesn't:
+       a. Try kv_offloading_size (async DMA, minimal perf impact)
+       b. Fall back to context length capping (handled by check_context_length_mismatch)
+    2. If weights slightly exceed VRAM (<30% over):
+       a. cpu_offload_gb + enforce_eager
+       b. BnB quantization fallback
+    3. If weights significantly exceed VRAM (>=30% over):
+       a. BnB quantization first (full GPU speed > full quality at terrible speed)
+       b. cpu_offload_gb as last resort
+    4. Nothing fits → BLOCK
     """
     estimated_bytes, details = estimate_model_memory(
         snapshot_path, model_config, max_model_len
@@ -636,7 +739,6 @@ def check_oom_estimate(
         # Get current free VRAM
         try:
             import torch
-
             free_vram, _ = torch.cuda.mem_get_info()
             available = min(usable, free_vram)
         except Exception:
@@ -653,29 +755,76 @@ def check_oom_estimate(
         return None
 
     ratio = estimated_bytes / available
+    weight_bytes = details.get("weight_bytes", 0)
+    kv_cache_bytes = details.get("kv_cache_bytes", 0)
 
     if ratio > 1.2:  # More than 20% over available
-        # Only weights can be offloaded to RAM, KV cache must stay on GPU
-        weight_bytes = details.get("weight_bytes", 0)
-        kv_cache_bytes = details.get("kv_cache_bytes", 0)
-
-        # Calculate VRAM available for weights (after reserving space for KV cache)
+        # ─── Determine what's causing the overflow ───
+        #
+        # Case A: Weights fit in VRAM, KV cache is the bottleneck
+        # Case B: Weights themselves exceed VRAM
         vram_for_weights = available - kv_cache_bytes
+        weight_ratio = weight_bytes / available if available > 0 else float("inf")
 
-        # Check if we can offload weights to fit
+        # ─── Case A: Weights fit, KV cache is the problem ───
+        if platform.has_gpu and weight_bytes <= available * 0.95:
+            # Try KV cache offloading first (best option — async, minimal perf hit)
+            kv_result = _try_kv_offload(
+                model_config=model_config,
+                platform=platform,
+                kv_cache_bytes=kv_cache_bytes,
+                available_vram=available,
+                weight_bytes=weight_bytes,
+                max_model_len=max_model_len or 4096,
+                kv_offload_max_ram_fraction=kv_offload_max_ram_fraction,
+                details=details,
+            )
+            if kv_result is not None:
+                return kv_result
+
+            # KV offloading rejected (RAM budget exceeded) — fall through.
+            # check_context_length_mismatch will cap context length later.
+            # Return a WARN so the user knows what happened.
+            if details.get("kv_offload_rejected"):
+                return CheckResult(
+                    check_id=CheckId.OOM_ESTIMATE,
+                    severity=CheckSeverity.WARN,
+                    message=f"KV cache ({kv_cache_bytes/1e9:.1f}GB) exceeds VRAM but "
+                    f"KV offloading would need {details.get('kv_offload_needed_gb', '?')}GB RAM "
+                    f"(budget: {details.get('kv_offload_ram_budget_gb', '?')}GB = "
+                    f"{kv_offload_max_ram_fraction:.0%} of system RAM). "
+                    f"Context length will be capped instead. "
+                    f"Increase VLLM_KV_OFFLOAD_MAX_RAM_FRACTION to allow more RAM usage.",
+                    details=details,
+                )
+
+        # ─── Case B: Weights exceed VRAM ───
         if platform.has_gpu and vram_for_weights > 0 and weight_bytes > vram_for_weights:
             offload_bytes = weight_bytes - vram_for_weights
             offload_gb = int((offload_bytes / 1e9) + 1)  # Round up + buffer
+            weight_overshoot = offload_bytes / weight_bytes  # fraction of weights to offload
 
+            # Decision: BnB first if >30% of weights need offloading,
+            # cpu_offload first if <=30% (moderate penalty is acceptable)
+            prefer_bnb = weight_overshoot > 0.30
+
+            if prefer_bnb:
+                # ─── Strategy: BnB quantization (preferred for large overshoot) ───
+                bnb_result = _try_bnb_quantization(
+                    model_config, platform, weight_bytes, kv_cache_bytes, available, details,
+                )
+                if bnb_result is not None:
+                    return bnb_result
+
+                # BnB not viable — fall through to cpu_offload as last resort
+
+            # ─── Strategy: cpu_offload_gb ───
             if platform.cpu_ram_bytes > (offload_gb * 1e9 * 1.5):
-                # vLLM V1 cpu_offload uses UVA (CUDA pinned memory).
-                # Check if the environment supports it.
+                # Check UVA / pinned memory support
                 pin_memory_ok = False
 
                 if platform.is_wsl:
                     # WSL does NOT support CUDA pinned memory (UVA).
-                    # torch.empty(pin_memory=True) silently succeeds on WSL
-                    # but vLLM's internal check correctly detects no UVA support.
                     pin_memory_ok = False
                 else:
                     try:
@@ -688,25 +837,32 @@ def check_oom_estimate(
 
                 if pin_memory_ok:
                     details["cpu_offload_gb"] = offload_gb
+                    details["weight_overshoot_pct"] = round(weight_overshoot * 100, 1)
+                    # Also signal enforce_eager when cpu_offload is active.
+                    # CUDA graphs + CPU offloading can cause issues on tight VRAM.
+                    details["force_enforce_eager"] = True
                     return CheckResult(
                         check_id=CheckId.OOM_ESTIMATE,
                         severity=CheckSeverity.AUTOFIX,
                         message=f"Weights ({weight_bytes/1e9:.1f}GB) + KV cache ({kv_cache_bytes/1e9:.1f}GB) "
-                        f"exceed {available/1e9:.1f}GB VRAM. Offloading {offload_gb}GB weights to RAM.",
+                        f"exceed {available/1e9:.1f}GB VRAM. Offloading {offload_gb}GB weights to RAM "
+                        f"({weight_overshoot:.0%} of weights). enforce_eager enabled for stability.",
                         auto_fixed=True,
                         details=details,
                     )
                 else:
-                    # Pin memory not available — try BnB on-the-fly quantization
-                    bnb_result = _try_bnb_quantization(
-                        model_config, platform, weight_bytes, kv_cache_bytes, available, details,
-                    )
-                    if bnb_result is not None:
-                        return bnb_result
+                    # Pin memory not available — try BnB if we haven't already
+                    if not prefer_bnb:
+                        bnb_result = _try_bnb_quantization(
+                            model_config, platform, weight_bytes, kv_cache_bytes, available, details,
+                        )
+                        if bnb_result is not None:
+                            return bnb_result
 
-                    # BnB not possible either — BLOCK
-                    reason = "WSL does not support CUDA pinned memory (UVA)" if platform.is_wsl else \
-                        "CUDA pinned memory (UVA) is not available in this environment"
+                    # Nothing works — BLOCK
+                    reason = ("WSL does not support CUDA pinned memory (UVA)"
+                              if platform.is_wsl else
+                              "CUDA pinned memory (UVA) is not available in this environment")
                     return CheckResult(
                         check_id=CheckId.OOM_ESTIMATE,
                         severity=CheckSeverity.BLOCK,
@@ -719,8 +875,24 @@ def check_oom_estimate(
                         details=details,
                     )
 
-        # Can't cpu_offload (no GPU, KV cache alone exceeds VRAM, or not enough RAM)
-        # Try BnB on-the-fly quantization as last resort
+            else:
+                # Not enough CPU RAM for offloading — try BnB if we haven't
+                if not prefer_bnb:
+                    bnb_result = _try_bnb_quantization(
+                        model_config, platform, weight_bytes, kv_cache_bytes, available, details,
+                    )
+                    if bnb_result is not None:
+                        return bnb_result
+
+            # ─── Strategy: BnB as last resort when cpu_offload was preferred ───
+            if not prefer_bnb:
+                # We already tried cpu_offload and it failed, BnB is our last shot
+                pass
+            else:
+                # We preferred BnB but it failed, cpu_offload also failed
+                pass
+
+        # Can't cpu_offload — try BnB as final fallback
         if platform.has_gpu:
             bnb_result = _try_bnb_quantization(
                 model_config, platform, weight_bytes, kv_cache_bytes, available, details,
@@ -851,24 +1023,37 @@ def check_cpu_dtype_incompatible(
     return None
 
 
-def check_vllm_v1_cpu_incompatible(is_cpu: bool) -> Optional[CheckResult]:
+def check_vllm_v1_cpu_incompatible(is_cpu: bool) -> "Optional[CheckResult]":
     """
-    Check #8: vLLM V1 engine doesn't support CPU. Auto-switch to V0.
+    Check #8: Verify CPU backend compatibility with the current vLLM version.
+
+    As of vLLM 0.11+, the V0 engine has been completely removed and
+    AsyncLLMEngine is just an alias for AsyncLLM (V1). The V1 engine
+    gained CPU support in vLLM ~0.13+. Setting VLLM_USE_V1=0 no longer
+    has any effect — there is no V0 to fall back to.
     """
+    import os
+
     if not is_cpu:
         return None
 
-    # Check if V1 is enabled (default in recent vLLM versions)
-    v1_enabled = os.environ.get("VLLM_USE_V1", "1") == "1"
+    try:
+        import vllm
+        version = getattr(vllm, "__version__", "0.0.0")
+        parts = version.split(".")
+        major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
 
-    if v1_enabled:
-        return CheckResult(
-            check_id=CheckId.VLLM_V1_CPU_INCOMPATIBLE,
-            severity=CheckSeverity.AUTOFIX,
-            message="vLLM V1 engine is not supported on CPU. "
-            "Auto-setting VLLM_USE_V1=0 to use V0 engine.",
-            auto_fixed=True,
-        )
+        if major == 0 and minor < 13:
+            return CheckResult(
+                check_id=CheckId.VLLM_V1_CPU_INCOMPATIBLE,
+                severity=CheckSeverity.WARN,
+                message=f"Running vLLM {version} on CPU. CPU support in the V1 "
+                f"engine was stabilized in vLLM 0.13+. You may encounter "
+                f"issues. Consider upgrading vLLM.",
+                suggestion="Upgrade to vLLM >= 0.13 for stable CPU support.",
+            )
+    except (ImportError, ValueError, IndexError):
+        pass
 
     return None
 
@@ -1198,7 +1383,10 @@ async def preflight_check(
             model_config,
             platform,
             config.vllm_gpu_memory_utilization,
-            effective_max_model_len,  # Use pre-capped value
+            effective_max_model_len,
+            kv_offload_max_ram_fraction=getattr(
+                config, "vllm_kv_offload_max_ram_fraction", 0.5
+            ),
         ),
         # AUTOFIX checks
         check_vllm_v1_cpu_incompatible(config.is_cpu),
@@ -1278,10 +1466,18 @@ async def preflight_check(
                 # CPU offload for models that don't fit in VRAM
                 if check.details.get("cpu_offload_gb"):
                     engine_overrides["cpu_offload_gb"] = check.details["cpu_offload_gb"]
+                    # Force enforce_eager when cpu_offload is active for stability
+                    if check.details.get("force_enforce_eager"):
+                        engine_overrides["enforce_eager"] = True
                 # BitsAndBytes on-the-fly quantization fallback
                 elif check.details.get("bnb_quantize"):
                     engine_overrides["quantization"] = "bitsandbytes"
                     engine_overrides["load_format"] = "bitsandbytes"
+            elif check.check_id == CheckId.KV_OFFLOAD_ENABLED:
+                kv_size = check.details.get("kv_offload_size_gb")
+                if kv_size:
+                    engine_overrides["kv_offloading_size"] = kv_size
+                    engine_overrides["kv_offloading_backend"] = "native"
 
     result.engine_overrides = engine_overrides
     return result
@@ -1444,5 +1640,6 @@ def get_recovery_hint(check_id: CheckId) -> str:
         CheckId.VLLM_V1_CPU_INCOMPATIBLE: "Running on CPU, V1 engine auto-disabled",
         CheckId.GATED_MODEL_NO_TOKEN: "Set HUGGING_FACE_HUB_TOKEN with a valid token",
         CheckId.MOE_ON_CPU: "Consider using a dense model for CPU inference",
+        CheckId.KV_OFFLOAD_ENABLED: "KV cache offloading to CPU auto-enabled",
     }
     return hints.get(check_id, "Try a different model")
