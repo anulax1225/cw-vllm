@@ -137,8 +137,10 @@ class ModelManager:
             # Detect model capabilities
             self.caps = detect_capabilities(
                 model_id=model,
-                model_config=getattr(preflight_result, "model_config", None) or {},
-                user_overrides=self._get_user_overrides()
+                config=getattr(preflight_result, "model_config", None) or {},
+                user_overrides=self._get_user_overrides(),
+                default_tool_parser=self.config.vllm_default_tool_parser,
+                default_reasoning_parser=self.config.vllm_default_reasoning_parser,
             )
 
             # Build engine args with preflight overrides
@@ -435,6 +437,10 @@ class ModelManager:
                 request=parser_request,
                 finish_reason=raw_finish_reason,
             )
+            logger.debug(
+                f"[non-stream] Parsed: tools_called={parsed.tools_called}, "
+                f"finish_reason={parsed.finish_reason}"
+            )
         else:
             parsed = ParsedOutput(content=raw_text, finish_reason=raw_finish_reason)
 
@@ -500,8 +506,19 @@ class ModelManager:
         else:
             request_parser = None
 
+        logger.info(
+            f"[stream] Starting streaming: request_parser={'yes' if request_parser else 'no'}, "
+            f"parser_request={'yes' if parser_request else 'no'}, "
+            f"caps={self.caps.family if self.caps else 'none'}, "
+            f"reasoning={self.caps.reasoning_parser if self.caps else 'none'}, "
+            f"tools={self.caps.tool_call_parser if self.caps else 'none'}"
+        )
+        # Reset stream log counter for this request
+        OutputParser._stream_log_count = 0
+
         previous_text = ""
         previous_token_ids: list[int] = []
+        chunk_count = 0
 
         try:
             async for request_output in results_generator:
@@ -515,8 +532,9 @@ class ModelManager:
                 delta_token_ids = current_token_ids[len(previous_token_ids):]
                 is_finished = output.finish_reason is not None
 
+                chunk_count += 1
+
                 if delta_text or is_finished:
-                    # Build SSE chunk delta
                     chunk_delta = {}
 
                     if request_parser and delta_text:
@@ -527,12 +545,25 @@ class ModelManager:
                             previous_token_ids=previous_token_ids,
                             current_token_ids=current_token_ids,
                             delta_token_ids=delta_token_ids,
-                            is_finished=is_finished,
+                            request=parser_request,
                         )
-                        if delta_msg.get("reasoning_content"):
-                            chunk_delta["reasoning_content"] = delta_msg["reasoning_content"]
-                        if delta_msg.get("content"):
-                            chunk_delta["content"] = delta_msg["content"]
+                        if delta_msg is not None:
+                            reasoning = (
+                                getattr(delta_msg, "reasoning_content", None)
+                                or getattr(delta_msg, "reasoning", None)
+                            )
+                            content = getattr(delta_msg, "content", None)
+                            tool_calls = getattr(delta_msg, "tool_calls", None)
+
+                            if isinstance(tool_calls, list) and len(tool_calls) == 0:
+                                tool_calls = None
+
+                            if reasoning:
+                                chunk_delta["reasoning_content"] = reasoning
+                            if content:
+                                chunk_delta["content"] = content
+                            if tool_calls:
+                                chunk_delta["tool_calls"] = self._serialize_tool_calls(tool_calls)
                     elif delta_text:
                         chunk_delta["content"] = delta_text
 
@@ -556,13 +587,24 @@ class ModelManager:
                     if is_finished:
                         finish_reason = self._map_finish_reason(output.finish_reason)
 
-                        # Check if tools were called across the full output
-                        if self.parser and self.parser.has_tools and parser_request:
-                            full_parsed = self.parser.parse(
-                                current_text, parser_request
-                            )
-                            if full_parsed.tools_called:
-                                finish_reason = "tool_calls"
+                        logger.info(
+                            f"[stream] Complete: {chunk_count} chunks, "
+                            f"finish_reason={finish_reason}"
+                        )
+
+                        # At end of stream, check if tools were called.
+                        # The tool parser should have emitted tool_call deltas
+                        # during streaming, but we also do a full non-streaming
+                        # parse as a safety net to set the correct finish_reason.
+                        if request_parser and request_parser.has_tools and parser_request:
+                            try:
+                                full_parsed = request_parser.parse(
+                                    current_text, parser_request
+                                )
+                                if full_parsed.tools_called:
+                                    finish_reason = "tool_calls"
+                            except Exception as e:
+                                logger.warning(f"End-of-stream tool check failed: {e}")
 
                         chunk = {
                             "id": f"chatcmpl-{request_id}",
@@ -607,35 +649,112 @@ class ModelManager:
             return "tool_calls"
         return "stop"
 
+    @staticmethod
+    def _serialize_tool_calls(tool_calls):
+        """Serialize vLLM DeltaToolCall objects to JSON-safe dicts."""
+        result = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                result.append(tc)
+            elif hasattr(tc, "model_dump"):
+                # Pydantic model (vLLM DeltaToolCall)
+                result.append(tc.model_dump(exclude_none=True))
+            else:
+                # Generic object with attributes
+                d = {"index": getattr(tc, "index", 0)}
+                if getattr(tc, "id", None):
+                    d["id"] = tc.id
+                if getattr(tc, "type", None):
+                    d["type"] = tc.type
+                fn = getattr(tc, "function", None)
+                if fn:
+                    d["function"] = {}
+                    if getattr(fn, "name", None):
+                        d["function"]["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        d["function"]["arguments"] = fn.arguments
+                result.append(d)
+        return result
+
     def _build_parser_request(
         self,
         messages: list,
         tools: list = None,
         tool_choice: str = "auto",
     ):
-        """Build a minimal request object for parser consumption.
+        """Build a minimal request object for vLLM parser consumption.
 
-        vLLM's parsers expect a ChatCompletionRequest. We try to construct one;
-        if it fails (Pydantic validation too strict), we return None and parsers
-        will fall back gracefully.
+        vLLM's tool parsers need a ChatCompletionRequest to work.
+        We try multiple import paths and construction approaches.
         """
         if not self.parser or (
             not self.parser.has_reasoning and not self.parser.has_tools
         ):
             return None
 
-        try:
-            from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+        # Try importing ChatCompletionRequest from known paths
+        ChatCompletionRequest = None
+        for module_path in [
+            "vllm.entrypoints.openai.protocol",
+            "vllm.entrypoints.openai.chat_completion.protocol",
+        ]:
+            try:
+                mod = __import__(module_path, fromlist=["ChatCompletionRequest"])
+                ChatCompletionRequest = getattr(mod, "ChatCompletionRequest")
+                break
+            except (ImportError, AttributeError):
+                continue
 
-            return ChatCompletionRequest(
+        if ChatCompletionRequest is None:
+            logger.warning(
+                "[_build_parser_request] ChatCompletionRequest not found "
+                "in any known vLLM module path"
+            )
+            return None
+
+        # Build the request — the Pydantic model can be strict about
+        # message format, so we try a few approaches
+        effective_tool_choice = tool_choice if tools else "none"
+
+        # Approach 1: pass messages and tools directly
+        try:
+            req = ChatCompletionRequest(
                 model=self.current_model,
                 messages=messages,
                 tools=tools,
-                tool_choice=tool_choice if tools else "none",
+                tool_choice=effective_tool_choice,
             )
-        except Exception as e:
-            logger.debug(
-                f"Could not build ChatCompletionRequest, parsers will use None: {e}"
+            logger.debug("[_build_parser_request] Built ChatCompletionRequest successfully")
+            return req
+        except Exception as e1:
+            logger.debug(f"[_build_parser_request] Direct construction failed: {e1}")
+
+        # Approach 2: minimal — just model + single user message + tools
+        try:
+            minimal_messages = [{"role": "user", "content": "placeholder"}]
+            req = ChatCompletionRequest(
+                model=self.current_model,
+                messages=minimal_messages,
+                tools=tools,
+                tool_choice=effective_tool_choice,
+            )
+            logger.debug("[_build_parser_request] Built with minimal messages")
+            return req
+        except Exception as e2:
+            logger.debug(f"[_build_parser_request] Minimal construction failed: {e2}")
+
+        # Approach 3: no tools — just enough for reasoning parser
+        try:
+            req = ChatCompletionRequest(
+                model=self.current_model,
+                messages=[{"role": "user", "content": "placeholder"}],
+            )
+            logger.debug("[_build_parser_request] Built without tools (reasoning-only)")
+            return req
+        except Exception as e3:
+            logger.warning(
+                f"[_build_parser_request] All construction attempts failed: {e3}",
+                exc_info=True
             )
             return None
 

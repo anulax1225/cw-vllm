@@ -2,6 +2,7 @@
 vLLM Manager Configuration.
 
 Uses pydantic-settings for env var parsing with sensible defaults.
+All settings are configurable via environment variables.
 """
 
 import re
@@ -75,18 +76,23 @@ class ManagerConfig(BaseSettings):
     vllm_enforce_eager: bool = False  # Force eager mode (no CUDA graphs)
     vllm_dtype: str = "auto"  # Explicit dtype override
 
-    # KV cache offloading settings
-    # Maximum percentage of system RAM that KV cache offloading is allowed to use.
-    # When the estimated KV offloading buffer would exceed this percentage, the
-    # preflight system caps context length instead of offloading.
-    # Range: 0.0 to 1.0 (e.g. 0.5 = 50% of RAM). Default: 0.5 (50%).
-    # Set to 0 to disable KV offloading entirely (always cap context instead).
-    vllm_kv_offload_max_ram_fraction: float = 0.5
-
-    # Capability overrides (None = auto-detect)
+    # Capability overrides (None = auto-detect from model family)
     vllm_reasoning_parser: Optional[str] = None  # VLLM_REASONING_PARSER
     vllm_tool_parser: Optional[str] = None  # VLLM_TOOL_PARSER
     vllm_chat_template: Optional[str] = None  # VLLM_CHAT_TEMPLATE
+
+    # Fallback defaults for unknown models (used when auto-detect finds no match).
+    # "hermes" is the most common tool call format (<tool_call>...</tool_call>)
+    # "deepseek_r1" uses generic <think>...</think> tags adopted by many models.
+    # These parsers are safe no-ops when the model doesn't emit those tokens.
+    # Set to "" to disable fallback (unknown models get no parsers).
+    vllm_default_tool_parser: str = "hermes"
+    vllm_default_reasoning_parser: str = "deepseek_r1"
+
+    # KV cache offloading — fraction of system RAM allowed for KV offload buffer.
+    # KV offloading moves KV cache blocks to CPU via async DMA (no pinned memory
+    # needed, works on WSL). Set to 0 to disable KV offloading entirely.
+    vllm_kv_offload_max_ram_fraction: float = 0.5
 
     @field_validator("vllm_max_model_len", mode="before")
     @classmethod
@@ -109,15 +115,17 @@ class ManagerConfig(BaseSettings):
             return None
         return v
 
-    @field_validator("vllm_kv_offload_max_ram_fraction", mode="before")
+    @field_validator(
+        "vllm_default_tool_parser",
+        "vllm_default_reasoning_parser",
+        mode="before",
+    )
     @classmethod
-    def clamp_ram_fraction(cls, v):
-        """Clamp to [0.0, 1.0] range."""
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return 0.5
-        return max(0.0, min(1.0, v))
+    def normalize_default_parsers(cls, v):
+        """Treat empty strings as disabled, strip whitespace."""
+        if isinstance(v, str):
+            return v.strip()
+        return v
 
     model_config = {"env_prefix": "", "extra": "ignore"}
 

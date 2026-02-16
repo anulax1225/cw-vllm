@@ -180,8 +180,7 @@ MODEL_FAMILIES: list[dict] = [
         "supports_tools": True,
     },
     # ── Fallback: unknown model ────────────────────────────────
-    # No parsers — basic chat only. Tools sent in prompt but
-    # responses will be raw text.
+    # No explicit match — _detect_fallback_parsers() handles defaults.
 ]
 
 
@@ -211,10 +210,121 @@ def _resolve_template_path(filename: str) -> Optional[str]:
     return None
 
 
+def _detect_fallback_parsers(
+    model_id: str,
+    config: dict,
+    default_tool_parser: str = "hermes",
+    default_reasoning_parser: str = "deepseek_r1",
+) -> ModelCapabilities:
+    """
+    Detect sensible default parsers for an unknown model by inspecting
+    its chat template and tokenizer vocabulary for known patterns.
+
+    Strategy:
+      1. If the model's chat template contains <think> tags → enable
+         deepseek_r1 reasoning parser (generic <think>...</think>)
+      2. If the chat template contains <tool_call> or tool_call patterns
+         → enable hermes tool parser
+      3. If no template clues, still default to the configured defaults
+         as they are safe no-ops when the model doesn't emit those tokens.
+    """
+    caps = ModelCapabilities()
+    caps.family = "unknown"
+
+    # Try to read the chat template from the model's tokenizer_config.json
+    chat_template_str = _get_chat_template_string(model_id, config)
+
+    has_think = False
+    has_tool_call = False
+
+    if chat_template_str:
+        tpl_lower = chat_template_str.lower()
+        # Check for <think> reasoning support
+        has_think = "<think>" in tpl_lower or "think" in tpl_lower
+        # Check for Hermes-style tool_call tags
+        has_tool_call = (
+            "<tool_call>" in tpl_lower
+            or "tool_call" in tpl_lower
+            or "tool_calls" in tpl_lower
+        )
+
+    # Apply configured defaults — these parsers are safe no-ops if the model
+    # doesn't emit the relevant tokens. Better to have them ready than
+    # to miss tool calls or reasoning from an unknown model.
+    if default_reasoning_parser:
+        caps.reasoning_parser = default_reasoning_parser
+        caps.default_enable_thinking = True
+        caps.supports_thinking = True
+
+    if default_tool_parser:
+        caps.tool_call_parser = default_tool_parser
+        caps.enable_tool_choice = True
+        caps.supports_tools = True
+
+    # Log what we detected
+    evidence = []
+    if has_think:
+        evidence.append("<think> in template")
+    if has_tool_call:
+        evidence.append("<tool_call> in template")
+    if not evidence:
+        evidence.append("no template clues, using configured defaults")
+
+    logger.info(
+        f"[caps] {model_id} -> unknown family, fallback parsers: "
+        f"reasoning={caps.reasoning_parser or 'none'}, "
+        f"tools={caps.tool_call_parser or 'none'} "
+        f"({', '.join(evidence)})"
+    )
+
+    return caps
+
+
+def _get_chat_template_string(model_id: str, config: dict) -> Optional[str]:
+    """
+    Try to extract the chat template string from the model.
+    Checks tokenizer_config.json in the HF cache.
+    """
+    try:
+        from huggingface_hub import scan_cache_dir
+        from huggingface_hub.constants import HF_HUB_CACHE
+        import json, os
+
+        cache_dir = Path(os.environ.get("HF_HOME", HF_HUB_CACHE))
+        if not cache_dir.exists():
+            return None
+
+        cache_info = scan_cache_dir(cache_dir)
+        for repo in cache_info.repos:
+            if repo.repo_id == model_id and repo.repo_type == "model":
+                for rev in repo.revisions:
+                    tokenizer_config = rev.snapshot_path / "tokenizer_config.json"
+                    if tokenizer_config.exists():
+                        with open(tokenizer_config) as f:
+                            tok_config = json.load(f)
+                        template = tok_config.get("chat_template")
+                        if isinstance(template, str):
+                            return template
+                        # Some models have a list of templates
+                        if isinstance(template, list) and template:
+                            # Return the first/default one
+                            for t in template:
+                                if isinstance(t, dict) and "template" in t:
+                                    return t["template"]
+                                if isinstance(t, str):
+                                    return t
+    except Exception as e:
+        logger.debug(f"Could not read chat template for {model_id}: {e}")
+
+    return None
+
+
 def detect_capabilities(
     model_id: str,
     config: dict,
     user_overrides: Optional[dict] = None,
+    default_tool_parser: str = "hermes",
+    default_reasoning_parser: str = "deepseek_r1",
 ) -> ModelCapabilities:
     """
     Auto-detect reasoning parser, tool parser, and chat template
@@ -225,6 +335,10 @@ def detect_capabilities(
         config: Model's config.json as a dict
         user_overrides: Explicit settings from env vars that should
                        not be overridden (VLLM_REASONING_PARSER, etc.)
+        default_tool_parser: Fallback tool parser for unknown models
+                            (from VLLM_DEFAULT_TOOL_PARSER env var)
+        default_reasoning_parser: Fallback reasoning parser for unknown models
+                                 (from VLLM_DEFAULT_REASONING_PARSER env var)
 
     Returns:
         ModelCapabilities with detected parsers and template
@@ -278,6 +392,22 @@ def detect_capabilities(
             )
             return caps
 
-    # No match — fallback
-    logger.warning(f"[caps] {model_id} -> unknown family, no parsers configured")
+    # ── No match — apply smart fallback defaults ──
+    # Use configured defaults (hermes + deepseek_r1 by default).
+    # These parsers are no-ops if the model doesn't emit their tokens.
+    caps = _detect_fallback_parsers(
+        model_id, config,
+        default_tool_parser=default_tool_parser,
+        default_reasoning_parser=default_reasoning_parser,
+    )
+
+    # Still respect user overrides
+    if "VLLM_REASONING_PARSER" in user_overrides:
+        caps.reasoning_parser = user_overrides["VLLM_REASONING_PARSER"]
+    if "VLLM_TOOL_PARSER" in user_overrides:
+        caps.tool_call_parser = user_overrides["VLLM_TOOL_PARSER"]
+        caps.enable_tool_choice = bool(caps.tool_call_parser)
+    if "VLLM_CHAT_TEMPLATE" in user_overrides:
+        caps.chat_template = user_overrides["VLLM_CHAT_TEMPLATE"]
+
     return caps
