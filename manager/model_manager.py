@@ -635,6 +635,231 @@ class ModelManager:
 
         yield "data: [DONE]\n\n"
 
+    # ── Text Completion ──────────────────────────────────────────
+
+    def _detect_fim_tokens(self) -> Optional[dict]:
+        """Detect FIM (Fill-In-The-Middle) special tokens from the tokenizer."""
+        if self.tokenizer is None:
+            return None
+
+        # Common FIM token patterns by model family
+        fim_patterns = [
+            # CodeLlama / StarCoder / DeepSeek style
+            {"prefix": "<fim_prefix>", "suffix": "<fim_suffix>", "middle": "<fim_middle>"},
+            # Qwen style
+            {"prefix": "<|fim_prefix|>", "suffix": "<|fim_suffix|>", "middle": "<|fim_middle|>"},
+            # CodeGemma style
+            {"prefix": "<|fim_prefix|>", "suffix": "<|fim_suffix|>", "middle": "<|fim_middle|>"},
+            # Codestral / Mistral style
+            {"prefix": "[PREFIX]", "suffix": "[SUFFIX]", "middle": "[MIDDLE]"},
+        ]
+
+        vocab = getattr(self.tokenizer, "get_vocab", lambda: {})()
+        if not vocab:
+            return None
+
+        for pattern in fim_patterns:
+            if all(token in vocab for token in pattern.values()):
+                logger.info(f"Detected FIM tokens: {pattern}")
+                return pattern
+
+        return None
+
+    def _build_fim_prompt(self, prompt: str, suffix: str, fim_tokens: dict) -> str:
+        """Build a FIM prompt using detected special tokens."""
+        return (
+            f"{fim_tokens['prefix']}{prompt}"
+            f"{fim_tokens['suffix']}{suffix}"
+            f"{fim_tokens['middle']}"
+        )
+
+    async def text_completion(
+        self,
+        prompt: str,
+        suffix: str = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False,
+        **kwargs,
+    ):
+        """
+        Generate text completion from a raw prompt (non-chat).
+        Returns OpenAI /v1/completions-compatible response format.
+
+        Unlike chat_completion(), this does NOT apply a chat template.
+        Supports FIM (fill-in-the-middle) via suffix parameter.
+        """
+        if self.engine is None or self.tokenizer is None:
+            raise RuntimeError("No model loaded")
+
+        self.last_used = time.time()
+
+        # Handle FIM: if suffix provided and model supports FIM tokens
+        effective_prompt = prompt
+        if suffix:
+            fim_tokens = self._detect_fim_tokens()
+            if fim_tokens:
+                effective_prompt = self._build_fim_prompt(prompt, suffix, fim_tokens)
+                logger.info(f"Using FIM tokens for completion (suffix={len(suffix)} chars)")
+            else:
+                # No FIM tokens — append suffix as context
+                effective_prompt = f"{prompt}\n{suffix}"
+                logger.info("No FIM tokens detected, appending suffix as context")
+
+        # Build sampling params
+        sampling_kwargs = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": kwargs.get("top_p", 1.0),
+            "frequency_penalty": kwargs.get("frequency_penalty", 0.0),
+            "presence_penalty": kwargs.get("presence_penalty", 0.0),
+        }
+
+        if kwargs.get("stop"):
+            sampling_kwargs["stop"] = kwargs["stop"]
+        if kwargs.get("seed") is not None:
+            sampling_kwargs["seed"] = kwargs["seed"]
+        if kwargs.get("top_k") is not None and kwargs["top_k"] > 0:
+            sampling_kwargs["top_k"] = kwargs["top_k"]
+        if kwargs.get("min_p") is not None and kwargs["min_p"] > 0:
+            sampling_kwargs["min_p"] = kwargs["min_p"]
+
+        sampling_params = SamplingParams(**sampling_kwargs)
+        request_id = str(uuid.uuid4())
+
+        if stream:
+            return self._stream_text_completion(
+                effective_prompt, sampling_params, request_id
+            )
+        else:
+            return await self._complete_text(
+                effective_prompt, sampling_params, request_id
+            )
+
+    async def _complete_text(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str,
+    ) -> dict:
+        """Non-streaming text completion."""
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+
+        final_output = None
+        async for request_output in results_generator:
+            final_output = request_output
+
+        if final_output is None or not final_output.outputs:
+            raise RuntimeError("No output generated")
+
+        output = final_output.outputs[0]
+        finish_reason = self._map_finish_reason(output.finish_reason)
+
+        return {
+            "id": f"cmpl-{request_id}",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": self.current_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": output.text,
+                    "finish_reason": finish_reason,
+                    "logprobs": None,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(final_output.prompt_token_ids),
+                "completion_tokens": len(output.token_ids),
+                "total_tokens": len(final_output.prompt_token_ids)
+                + len(output.token_ids),
+            },
+        }
+
+    async def _stream_text_completion(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: str,
+    ) -> AsyncIterator[str]:
+        """Streaming text completion (SSE)."""
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+
+        previous_text = ""
+        chunk_count = 0
+
+        try:
+            async for request_output in results_generator:
+                if not request_output.outputs:
+                    continue
+
+                output = request_output.outputs[0]
+                current_text = output.text
+                delta_text = current_text[len(previous_text):]
+                is_finished = output.finish_reason is not None
+
+                chunk_count += 1
+
+                if delta_text:
+                    chunk = {
+                        "id": f"cmpl-{request_id}",
+                        "object": "text_completion.chunk",
+                        "created": int(time.time()),
+                        "model": self.current_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": delta_text,
+                                "finish_reason": None,
+                                "logprobs": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                if is_finished:
+                    finish_reason = self._map_finish_reason(output.finish_reason)
+
+                    logger.info(
+                        f"[text-stream] Complete: {chunk_count} chunks, "
+                        f"finish_reason={finish_reason}"
+                    )
+
+                    # Final chunk with usage stats
+                    chunk = {
+                        "id": f"cmpl-{request_id}",
+                        "object": "text_completion.chunk",
+                        "created": int(time.time()),
+                        "model": self.current_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": "",
+                                "finish_reason": finish_reason,
+                                "logprobs": None,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": len(request_output.prompt_token_ids),
+                            "completion_tokens": len(output.token_ids),
+                            "total_tokens": len(request_output.prompt_token_ids)
+                            + len(output.token_ids),
+                        },
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                previous_text = current_text
+
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.info(f"Client disconnected, aborting text completion {request_id}")
+            try:
+                await self.engine.abort(request_id)
+            except Exception as e:
+                logger.debug(f"Abort failed for {request_id} (non-fatal): {e}")
+            return
+
+        yield "data: [DONE]\n\n"
+
     @staticmethod
     def _map_finish_reason(reason) -> str:
         """Map vLLM finish reason to OpenAI format."""

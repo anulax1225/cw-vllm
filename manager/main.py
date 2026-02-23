@@ -97,6 +97,10 @@ class DeleteRequest(BaseModel):
     name: str
 
 
+class SwitchRequest(BaseModel):
+    name: str
+
+
 class ValidateRequest(BaseModel):
     name: str
 
@@ -212,6 +216,95 @@ async def list_loaded_models(request: Request):
         })
 
     return {"object": "list", "data": models}
+
+
+# ─── Text Completion: /v1/completions (OpenAI-compatible) ──────────
+
+@app.post("/v1/completions")
+async def text_completions(request: Request):
+    """
+    OpenAI-compatible text completions (non-chat).
+    Supports FIM (fill-in-the-middle) via suffix parameter.
+    Auto-loads/switches model based on request body.
+    """
+    mgr: ModelManager = request.app.state.model_mgr
+    cache: HFCacheManager = request.app.state.cache_mgr
+    body = await request.json()
+
+    model = body.get("model")
+    if not model:
+        raise HTTPException(status_code=400, detail="'model' field is required")
+
+    prompt = body.get("prompt")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="'prompt' field is required")
+
+    keep_alive = body.pop("keep_alive", None)
+    stream = body.get("stream", False)
+
+    # Verify model is in cache
+    if not cache.is_cached(model):
+        pass
+
+    # Ensure model is loaded (auto-switch if different)
+    try:
+        await mgr.ensure_loaded(model, keep_alive=keep_alive)
+    except PreflightError as e:
+        logger.error(f"Preflight blocked model: {e.result.block_reason}")
+        check = e.result.checks[0] if e.result.checks else None
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": e.result.block_reason,
+                    "type": "model_load_error",
+                    "code": check.check_id.value if check else "UNKNOWN",
+                    "suggestion": check.suggestion if check else None,
+                    "checks": [c.to_dict() for c in e.result.checks],
+                }
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=503, detail=f"Failed to load model {model}: {e}")
+
+    if mgr.engine is None:
+        raise HTTPException(status_code=503, detail="Model not ready")
+
+    # Generate text completion
+    try:
+        response = await mgr.text_completion(
+            prompt=prompt,
+            suffix=body.get("suffix"),
+            temperature=body.get("temperature", 0.7),
+            max_tokens=body.get("max_tokens", 2048),
+            stream=stream,
+            top_p=body.get("top_p", 1.0),
+            top_k=body.get("top_k"),
+            min_p=body.get("min_p"),
+            frequency_penalty=body.get("frequency_penalty", 0.0),
+            presence_penalty=body.get("presence_penalty", 0.0),
+            stop=body.get("stop"),
+            seed=body.get("seed"),
+        )
+
+        # Handle keep_alive=0 (unload after request)
+        if keep_alive == 0:
+            asyncio.create_task(mgr.unload())
+
+        if stream:
+            return StreamingResponse(
+                response,
+                media_type="text/event-stream",
+            )
+        else:
+            return response
+
+    except Exception as e:
+        logger.error(f"Text completion error: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Model Management (Ollama-compatible) ──────────────────────────
@@ -358,6 +451,52 @@ async def delete_model(req: DeleteRequest, request: Request):
         raise HTTPException(status_code=404, detail=f"Model '{req.name}' not found")
 
     return {"status": "success"}
+
+
+# ─── Model Switch ─────────────────────────────────────────────────
+
+@app.post("/api/switch")
+async def switch_model(req: SwitchRequest, request: Request):
+    """
+    Pre-warm: explicitly load a model before inference.
+    Optional — models auto-load on first inference request (Ollama behavior).
+    Useful for avoiding cold-start delay when changing agent config.
+    """
+    mgr: ModelManager = request.app.state.model_mgr
+    cache: HFCacheManager = request.app.state.cache_mgr
+
+    if not cache.is_cached(req.name):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{req.name}' not found in cache. Pull it first with POST /api/pull.",
+        )
+
+    try:
+        await mgr.ensure_loaded(req.name)
+    except PreflightError as e:
+        logger.error(f"Preflight blocked model switch: {e.result.block_reason}")
+        check = e.result.checks[0] if e.result.checks else None
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": e.result.block_reason,
+                    "type": "model_load_error",
+                    "code": check.check_id.value if check else "UNKNOWN",
+                    "suggestion": check.suggestion if check else None,
+                }
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to switch model: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=503, detail=f"Failed to switch to {req.name}: {e}")
+
+    return {
+        "status": "success",
+        "model": req.name,
+        "message": f"Model {req.name} loaded and ready",
+    }
 
 
 # ─── Health & Status ───────────────────────────────────────────────
